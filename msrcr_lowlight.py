@@ -14,28 +14,50 @@ import torch
 import random
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim.lr_scheduler import StepLR
+import torchvision.transforms as T
+from torch.utils.data import Dataset
 from torchvision import models
 from torchvision import transforms
-from pytorch_msssim import ssim as ssim_pytorch
-from timm import create_model
+from pytorch_msssim import ms_ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr, structural_similarity as ssim
+from PIL import Image
 from glob import glob
+from datetime import datetime
+
+# Set global random seeds for reproduciblity
+torch.manual_seed(42)
+np.random.seed(42)
+random.seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)
 
 # ------------------------------------------------
 # Download LOL-v2 Dataset from Kaggle
 # ------------------------------------------------
-def load_lolv2_dataset(base_dir=None, num_samples=3, use_synthetic=True):
+def load_lolv2_dataset(base_dir=None, num_samples=3, use_synthetic=True, use_train=True):
     if base_dir is None:
-        base_dir = kagglehub.dataset_download("tanhyml/lol-v2-dataset")
+        try:
+            base_dir = kagglehub.dataset_download("tanhyml/lol-v2-dataset")
+        except Exception as e:
+            print("KaggleHub download failed, please provide local dataset path.")
+            raise e
+        
         base_dir = os.path.join(base_dir, "LOL-v2")
 
-    # Choose between real captured or synthetic data
-    data_type = "Synthetic" if use_synthetic else "Real_captured"
-    train_dir = os.path.join(base_dir, data_type, "Train")
+    if use_train:
+        # Choose between real captured or synthetic Train data
+        data_type = "Synthetic" if use_synthetic else "Real_captured"
+        train_dir = os.path.join(base_dir, data_type, "Train")
 
-    low_dir = os.path.join(train_dir, "Low")
-    high_dir = os.path.join(train_dir, "Normal")
+        low_dir = os.path.join(train_dir, "Low")
+        high_dir = os.path.join(train_dir, "Normal")
+    else: 
+        # Choose between real captured or synthetic Test data
+        data_type = "Synthetic" if use_synthetic else "Real_captured"
+        test_dir = os.path.join(base_dir, data_type, "Test")
+
+        low_dir = os.path.join(test_dir, "Low")
+        high_dir = os.path.join(test_dir, "Normal")
 
     # Get image file lists
     low_images = sorted(glob(os.path.join(low_dir, "*.png")))[:num_samples]
@@ -44,8 +66,8 @@ def load_lolv2_dataset(base_dir=None, num_samples=3, use_synthetic=True):
     # Load and pair images
     pairs = []
     for l, h in zip(low_images, high_images):
-        low_img = cv2.imread(l)
-        high_img = cv2.imread(h)
+        low_img = cv2.cvtColor(cv2.imread(l), cv2.COLOR_BGR2RGB)
+        high_img = cv2.cvtColor(cv2.imread(h), cv2.COLOR_BGR2RGB)
         if low_img is not None and high_img is not None:
             pairs.append((low_img, high_img))
 
@@ -120,7 +142,7 @@ class VGGPerceptual(nn.Module):
         vgg16 = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).features[:16] # Up to relu3_3
         for param in vgg16.parameters():
             param.requires_grad = False
-            self.vgg16 = vgg16.to(device)
+        self.vgg16 = vgg16.to(device)
 
     def forward(self, x):  
         # Rescale input to [0,1] -> [0,1] expected by VGG normalization  
@@ -129,136 +151,191 @@ class VGGPerceptual(nn.Module):
         mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1,3,1,1)  
         std = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1,3,1,1)  
         x = (x - mean) / std  
-        return self.vgg16(x)  
+        return self.vgg16(x)
+    
+# --- Mixed dataset for synthetic + real samples ---
+class MixedDataset(Dataset):
+    def __init__(self, synth_list, real_list, real_ratio=0.2):
+        self.synth = synth_list
+        self.real = real_list
+        self.real_ratio = real_ratio
+        self.length = max(len(self.synth), len(self.real))
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        if len(self.real) > 0 and random.random() < self.real_ratio:
+            return self.real[idx % len(self.real)]
+        else:
+            return self.synth[idx % len(self.synth)]
+
+# --- Color consistency loss ---
+def color_consistency_loss(img):
+    mean_rgb = img.mean(dim=[2,3])
+    mean_gray = mean_rgb.mean(dim=1, keepdim=True)
+    return ((mean_rgb - mean_gray) ** 2).mean()
     
 class SimpleRetinexNet(nn.Module):
     def __init__(self):
         super(SimpleRetinexNet, self).__init__()
-        mobilenet = models.mobilenet_v2(pretrained=True).features
+        mobilenet = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.IMAGENET1K_V1).features
+        self.encoder = nn.Sequential(*mobilenet[:14])
+        for p in self.encoder.parameters():
+            p.requires_grad = True
 
-        self.model = nn.Sequential(*mobilenet[:14])  # Up to the last inverted residual
+        self.fusion = nn.Sequential(
+            nn.Conv2d(96, 64, 3, padding=1),  # <-- changed from 160 → 96
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.ReLU(inplace=True)
+        )
 
-        for name, param in self.model.named_parameters():
-            if "13" not in name and "12" not in name:
-                param.requires_grad = False
-
-        # fusion_conv channels = sum of selected feature channels (here 192)
-        self.fusion_conv = nn.Conv2d(192, 64, kernel_size=1)
-        self.conv_out = nn.Conv2d(64, 3, kernel_size=1)
+        self.reflectance_head = nn.Conv2d(32, 3, 1)
+        self.illumination_head = nn.Conv2d(32, 1, 1)
 
     def forward(self, x):
-        # save original spatial size
-        _, _, H_in, W_in = x.shape
-        features = []
-        cur = x
-        for i, layer in enumerate(self.model):
-            cur = layer(cur)
-            if i in [4, 7, 13]:
-                features.append(cur)
+        f = self.encoder(x)
+        f = self.fusion(f)
+        R = torch.tanh(self.reflectance_head(f))
+        R = (R + 1) / 2
+        L = torch.sigmoid(self.illumination_head(f))
+        enhanced = torch.clamp(R * L, 0, 1)
 
-        # if for any reason features list shorter, fall back
-        if len(features) == 0:
-            # fallback: just run through a small head
-            out = torch.sigmoid(self.conv_out(F.relu(self.fusion_conv(cur))))
-            out = F.interpolate(out, size=(H_in, W_in), mode='bilinear', align_corners=False)
-            return out
+        # Upsample all outputs back to input size
+        enhanced = F.interpolate(enhanced, size=(x.shape[2], x.shape[3]), mode='bilinear', align_corners=False)
+        R = F.interpolate(R, size=(x.shape[2], x.shape[3]), mode='bilinear', align_corners=False)
+        L = F.interpolate(L, size=(x.shape[2], x.shape[3]), mode='bilinear', align_corners=False)
+        return enhanced, R, L
 
-        # Multi-scale fusion with bilinear upsampling to same spatial dims (use last feature's size)
-        target_h, target_w = features[-1].shape[2], features[-1].shape[3]
-        upsampled = [F.interpolate(f, size=(target_h, target_w), mode='bilinear', align_corners=False)
-                     for f in features]
-        fused = torch.cat(upsampled, dim=1)        # channels must match fusion_conv in_channels
-        fused = F.relu(self.fusion_conv(fused))
-        out = torch.sigmoid(self.conv_out(fused))
-
-        # Upsample to original input resolution so loss can be computed
-        out = F.interpolate(out, size=(H_in, W_in), mode='bilinear', align_corners=False)
-        return out
-    
 def enhance_with_retinexnet(img, model, device):
     transform = transforms.Compose([
-        transforms.ToTensor(),  # outputs [0,1]
-        transforms.Resize((256, 256)),
+        transforms.Resize((512, 512)),
+        transforms.ToTensor()
     ])
-    input_tensor = transform(img).unsqueeze(0).to(device)
+    img_pil = Image.fromarray(img)
+    input_tensor = transform(img_pil).unsqueeze(0).to(device)
+    model.eval()
     with torch.no_grad():
-        output = model(input_tensor)  # [0,1] already from sigmoid
-    # Scale to [0,255] for visualization
-    output_img = output.squeeze(0).permute(1, 2, 0).cpu().numpy()
-    output_img = np.clip(output_img * 255, 0, 255).astype(np.uint8)
-    return cv2.resize(output_img, (img.shape[1], img.shape[0]))
+        out, R, L = model(input_tensor)
+    out_np = (out.squeeze(0).permute(1,2,0).cpu().numpy() * 255).astype(np.uint8)
+    return cv2.resize(out_np, (img.shape[1], img.shape[0]))
 
 # ------------------------------------------------
 # RetinexNet Fine-Tuning on LOL-v2
 # ------------------------------------------------
+# --- Total Variation Loss for smoothness without blur ---
+def total_variation_loss(img):
+    return torch.mean(torch.abs(img[:, :, :, :-1] - img[:, :, :, 1:])) + \
+           torch.mean(torch.abs(img[:, :, :-1, :] - img[:, :, 1:, :]))
+
+# --- Data augmentation ---
+augment = T.Compose([
+    T.RandomHorizontalFlip(),
+    T.RandomVerticalFlip(),
+    T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2),
+    T.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 1.5))
+])
+
 def train_retinexnet(model, train_loader_synth, train_loader_real, device, vgg):
-    """Fine-tune RetinexNet on synthetic then real images with perceptual + SSIM loss."""
-    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.8)
+    """Enhanced RetinexNet training with illumination decomposition, color consistency, and mixed-data pretraining."""
     criterion_l1 = nn.L1Loss()
+    real_ratio = 0.2
+    phase1_epochs, phase2_epochs = 50, 100
 
-    print("Phase 1: Training on synthetic images...")  
-    for epoch in range(3):  # Synthetic pre-training  
-        running_loss = 0.0  
-        for low, high in train_loader_synth:  
-            low, high = low.to(device), high.to(device)  
+    # Phase 1: Mixed synthetic + real pretraining
+    synth_list = list(train_loader_synth.dataset)
+    real_list = list(train_loader_real.dataset)
+    mixed_dataset = MixedDataset(synth_list, real_list, real_ratio)
+    mixed_loader = torch.utils.data.DataLoader(mixed_dataset, batch_size=12, shuffle=True)
 
-            optimizer.zero_grad()  
-            output = model(low)  
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=phase1_epochs + phase2_epochs)
 
-            # L1 loss  
-            loss_l1 = criterion_l1(output, high)  
+    print("Phase 1: Mixed Pretraining (Synthetic + Real)")
+    for epoch in range(phase1_epochs):
+        model.train()
+        running_loss = 0.0
+        for low, high in mixed_loader:
+            low, high = low.to(device), high.to(device)
+            optimizer.zero_grad()
+            out, R, L = model(low)
 
-            # Perceptual loss (VGG features)  
-            loss_percep = F.mse_loss(vgg(output), vgg(high))  
+            out_gamma = torch.pow(torch.clamp(out, 1e-6, 1.0), 0.9)
+            high_gamma = torch.pow(torch.clamp(high, 1e-6, 1.0), 0.9)
 
-            # SSIM loss  
-            loss_ssim = 1 - ssim_pytorch(output, high, data_range=1.0, size_average=True)  
+            loss_l1 = criterion_l1(out, high)
+            loss_percep = F.mse_loss(vgg(out_gamma), vgg(high_gamma))
+            loss_ssim = 1 - ms_ssim(out_gamma, high_gamma, data_range=1.0).mean()
+            loss_tv = total_variation_loss(L)
 
-            # Combined loss  
-            loss = loss_l1 + 0.1*loss_percep + 0.1*loss_ssim  
+            loss = (1.0 * loss_l1) + (0.05 * loss_percep) + (0.5 * loss_ssim) + (0.1 * loss_tv)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
 
-            loss.backward()  
-            optimizer.step()  
-            running_loss += loss.item()  
+        scheduler.step()
+        print(f"[Phase1 Epoch {epoch+1}/{phase1_epochs}] Loss: {running_loss/len(mixed_loader):.6f}")
 
-        scheduler.step()  
-        print(f"[Synthetic Epoch {epoch+1}/3] Loss: {running_loss/len(train_loader_synth):.4f}")  
+    # Phase 2: Fine-tune on real only
+    print("\nPhase 2: Fine-tuning on Real Data")
+    optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=5e-6, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2)
 
-    print("\nPhase 2: Fine-tuning on real-captured images...")  
-    for epoch in range(5):  # Increased epochs from 2 → 5  
-        running_loss = 0.0  
-        for low, high in train_loader_real:  
-            low, high = low.to(device), high.to(device)  
+    for epoch in range(phase2_epochs):
+        model.train()
+        running_loss = 0.0
+        for low, high in train_loader_real:
+            low, high = low.to(device), high.to(device)
+            optimizer.zero_grad()
+            out, R, L = model(low)
 
-            optimizer.zero_grad()  
-            output = model(low)  
+            out_gamma = torch.pow(torch.clamp(out, 1e-6, 1.0), 0.9)
+            high_gamma = torch.pow(torch.clamp(high, 1e-6, 1.0), 0.9)
 
-            # L1 + perceptual + SSIM losses  
-            loss_l1 = criterion_l1(output, high)  
-            loss_percep = F.mse_loss(vgg(output), vgg(high))  
-            loss_ssim = 1 - ssim_pytorch(output, high, data_range=1.0, size_average=True)  
+            loss_l1 = criterion_l1(out, high)
+            loss_percep = F.mse_loss(vgg(out_gamma), vgg(high_gamma))
+            loss_ssim = 1 - ms_ssim(out_gamma, high_gamma, data_range=1.0).mean()
+            loss_tv = total_variation_loss(L)
 
-            loss = loss_l1 + 0.1*loss_percep + 0.1*loss_ssim  
+            loss = (1.0 * loss_l1) + (0.05 * loss_percep) + (0.5 * loss_ssim) + (0.1 * loss_tv)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item()
 
-            loss.backward()  
-            optimizer.step()  
-            running_loss += loss.item()  
+        scheduler.step()
+        print(f"[Phase2 Epoch {epoch+1}/{phase2_epochs}] Loss: {running_loss/len(train_loader_real):.6f}")
 
-        print(f"[Real FT Epoch {epoch+1}/5] Loss: {running_loss/len(train_loader_real):.4f}")  
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    os.makedirs("Models", exist_ok=True)
+    torch.save(model.state_dict(), f"Models/retinexnet_finetuned_{timestamp}.pth")
+    print(f"Training complete. Saved model as retinexnet_finetuned_{timestamp}.pth")
+    model.eval()
+    return model
 
-    torch.save(model.state_dict(), "retinexnet_finetuned_real_improved.pth")  
-    print("Fine-tuning complete. Model saved as retinexnet_finetuned_real_improved.pth.")  
-
-    model.eval()  
-    return model  
+# ================================
+# Post-processing Step
+# ================================
+def enhance_postprocess(img_tensor):
+    """Apply CLAHE + unsharp masking to improve local contrast and sharpness."""
+    img = (img_tensor.detach().cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l_clahe = clahe.apply(l)
+    lab = cv2.merge((l_clahe, a, b))
+    img_clahe = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+    img_sharp = cv2.detailEnhance(img_clahe, sigma_s=8, sigma_r=0.12)
+    img_final = cv2.addWeighted(img_clahe, 0.8, img_sharp, 0.2, 0)
+    img_final = cv2.fastNlMeansDenoisingColored(img_final, None, 3, 3, 7, 21)
+    return np.clip(img_final / 255.0, 0, 1)
 
 # ------------------------------------------------
 # Visualization and Evaluation
 # ------------------------------------------------
 def visualize_results(low, high, enhanced_ssr, enhanced_msr, enhanced_reti, idx):
     plt.figure(figsize=(15, 5))
-    titles = ["Low-light", "Ground Truth", "SSR", "MSR", "RetinexNet"]
+    titles = ["Low-light", "Ground Truth", "SSR", "MSRCR", "RetinexNet"]
     images = [low, high, enhanced_ssr, enhanced_msr, enhanced_reti]
     for i, (img, title) in enumerate(zip(images, titles)):
         plt.subplot(1, 5, i + 1)
@@ -266,7 +343,7 @@ def visualize_results(low, high, enhanced_ssr, enhanced_msr, enhanced_reti, idx)
         plt.title(title)
         plt.axis('off')
     plt.tight_layout()
-    plt.savefig(f"comparison_{idx}.png")
+    plt.savefig(f"Model_Comparisons/comparison_{idx}.png")
     plt.close()
 
 # ------------------------------------------------
@@ -281,47 +358,45 @@ def evaluate_metrics(enhanced, reference):
 # ------------------------------------------------
 # Main Execution
 # ------------------------------------------------
+# Preprocess image pairs to tensors
+def preprocess_pairs(pairs):
+    data = []
+    transform = transforms.Compose([
+        transforms.Resize((512, 512)),
+        transforms.ToTensor()
+    ])
+    for low, high in pairs:
+        # Convert NumPy arrays (RGB) -> PIL for torchvision transforms
+        low_pil = Image.fromarray(low)
+        high_pil = Image.fromarray(high)
+
+        low_t = transform(low_pil)
+        high_t = transform(high_pil)
+        data.append((low_t, high_t))
+    return data
+    
 def main():
     # Load LOL-v2 dataset paths
     print("Loading training data...")
-    pairs_synth = load_lolv2_dataset(use_synthetic=True, num_samples=200) # Synthetic
-    pairs_real = load_lolv2_dataset(use_synthetic=False, num_samples=50) # Real
+    train_pairs_synth = load_lolv2_dataset(use_synthetic=True, num_samples=64, use_train=True)
+    train_pairs_real = load_lolv2_dataset(use_synthetic=False, num_samples=128, use_train=True)
+    test_pairs_real = load_lolv2_dataset(use_synthetic=False, num_samples=24, use_train=False)
+
+    test_pairs = test_pairs_real
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # ------------------------------------------------
-    # Split real images into fine-tuning and testing sets
-    # ------------------------------------------------
-    random.shuffle(pairs_real)
-    num_real_test = 10
-    test_pairs_real = pairs_real[:num_real_test]       # unseen images for evaluation
-    train_pairs_real = pairs_real[num_real_test:]      # rest for fine-tuning
-
-    # Preprocess image pairs to tensors
-    def preprocess_pairs(pairs):
-        data = []
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Resize((512, 512))
-        ])
-        for low, high in pairs:
-            low_t = transform(cv2.cvtColor(low, cv2.COLOR_BGR2RGB))
-            high_t = transform(cv2.cvtColor(high, cv2.COLOR_BGR2RGB))
-            data.append((low_t, high_t))
-        return data
-
-    dataset_synth = preprocess_pairs(pairs_synth)
+    dataset_synth = preprocess_pairs(train_pairs_synth)
     dataset_real_train = preprocess_pairs(train_pairs_real)
 
-    train_loader_synth = torch.utils.data.DataLoader(dataset_synth, batch_size=4, shuffle=True)
-    train_loader_real = torch.utils.data.DataLoader(dataset_real_train, batch_size=2, shuffle=True)
+    train_loader_synth = torch.utils.data.DataLoader(dataset_synth, batch_size=16, shuffle=True)
+    train_loader_real = torch.utils.data.DataLoader(dataset_real_train, batch_size=8, shuffle=True)
 
     # Initialize model
     retinexnet = SimpleRetinexNet().to(device)
     vgg = VGGPerceptual(device)
     retinexnet = train_retinexnet(retinexnet, train_loader_synth, train_loader_real, device, vgg)
-
 
     # ------------------------------------------------
     # Evaluation phase (using unseen real test images)
@@ -330,13 +405,13 @@ def main():
     psnr_msr_all, ssim_msr_all = [], []
     psnr_reti_all, ssim_reti_all = [], []
 
-    for idx, (low_img, high_img) in enumerate(test_pairs_real):
-        low = cv2.cvtColor(low_img, cv2.COLOR_BGR2RGB)
-        high = cv2.cvtColor(high_img, cv2.COLOR_BGR2RGB)
+    for idx, (low_img, high_img) in enumerate(test_pairs):
+        low = low_img
+        high = high_img
 
         # Classical Retinex variants
         low_balanced = gray_world_white_balance(low)
-        enhanced_ssr = single_scale_retinex(low_balanced)
+        enhanced_ssr = single_scale_retinex(low)
         enhanced_msr = multi_scale_retinex(low_balanced)
 
         # Deep RetinexNet
