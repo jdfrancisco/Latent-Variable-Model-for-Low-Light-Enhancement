@@ -221,6 +221,37 @@ def enhance_with_retinexnet(img, model, device):
     out_np = (out.squeeze(0).permute(1,2,0).cpu().numpy() * 255).astype(np.uint8)
     return cv2.resize(out_np, (img.shape[1], img.shape[0]))
 
+def enhance_hybrid_msrcr_retinexnet(low_img, model, device):
+    """
+    Hybrid pipeline:
+        Step 1: MSRCR (Classical illumination correction)
+        Step 2: RetinexNet (ML refinement)
+    """
+
+    # Step 1: Classical MSRCR
+    msrcr_img = msrcr_ycbcr(low_img)
+
+    # Convert MSRCR output to tensor for RetinexNet
+    transform = transforms.Compose([
+        transforms.Resize((512, 512)),
+        transforms.ToTensor()
+    ])
+    msrcr_pil = Image.fromarray(msrcr_img)
+    input_tensor = transform(msrcr_pil).unsqueeze(0).to(device)
+
+    # Step 2: CNN Refinement
+    model.eval()
+    with torch.no_grad():
+        out, R, L = model(input_tensor)
+
+    # Convert back to uint8 Numpy
+    out_np = (out.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+
+    # Resiize back to original resolution
+    refined = cv2.resize(out_np, (low_img.shape[1], low_img.shape[0]))
+
+    return msrcr_img, refined
+
 # ------------------------------------------------
 # RetinexNet Fine-Tuning on LOL-v2
 # ------------------------------------------------
@@ -333,12 +364,12 @@ def enhance_postprocess(img_tensor):
 # ------------------------------------------------
 # Visualization and Evaluation
 # ------------------------------------------------
-def visualize_results(low, high, enhanced_ssr, enhanced_msr, enhanced_reti, idx):
-    plt.figure(figsize=(15, 5))
-    titles = ["Low-light", "Ground Truth", "SSR", "MSRCR", "RetinexNet"]
-    images = [low, high, enhanced_ssr, enhanced_msr, enhanced_reti]
+def visualize_results(low, high, enhanced_ssr, enhanced_msr, enhanced_reti, enhanced_hybrid, idx):
+    plt.figure(figsize=(18, 6))
+    titles = ["Low-light", "Ground Truth", "SSR", "MSRCR", "RetinexNet", "Hybrid"]
+    images = [low, high, enhanced_ssr, enhanced_msr, enhanced_reti, enhanced_hybrid]
     for i, (img, title) in enumerate(zip(images, titles)):
-        plt.subplot(1, 5, i + 1)
+        plt.subplot(1, 6, i + 1)
         plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
         plt.title(title)
         plt.axis('off')
@@ -404,6 +435,7 @@ def main():
     psnr_ssr_all, ssim_ssr_all = [], []
     psnr_msr_all, ssim_msr_all = [], []
     psnr_reti_all, ssim_reti_all = [], []
+    psnr_hybrid_all, ssim_hybrid_all = [], []
 
     for idx, (low_img, high_img) in enumerate(test_pairs):
         low = low_img
@@ -417,13 +449,17 @@ def main():
         # Deep RetinexNet
         enhanced_retinexnet = enhance_with_retinexnet(low, retinexnet, device)
 
+        # Hybrid MSRCR -> ReinexNet
+        msrcr_img, hybrid_retinex = enhance_hybrid_msrcr_retinexnet(low, retinexnet, device)
+
         # Visualization
-        visualize_results(low, high, enhanced_ssr, enhanced_msr, enhanced_retinexnet, idx)
+        visualize_results(low, high, enhanced_ssr, enhanced_msr, enhanced_retinexnet, hybrid_retinex, idx)
 
         # Evaluation metrics
         psnr_ssr, ssim_ssr = evaluate_metrics(enhanced_ssr, high)
         psnr_msr, ssim_msr = evaluate_metrics(enhanced_msr, high)
         psnr_reti, ssim_reti = evaluate_metrics(enhanced_retinexnet, high)
+        psnr_hybrid, ssim_hybrid = evaluate_metrics(hybrid_retinex, high)
 
         psnr_ssr_all.append(psnr_ssr)
         ssim_ssr_all.append(ssim_ssr)
@@ -431,6 +467,8 @@ def main():
         ssim_msr_all.append(ssim_msr)
         psnr_reti_all.append(psnr_reti)
         ssim_reti_all.append(ssim_reti)
+        psnr_hybrid_all.append(psnr_hybrid)
+        ssim_hybrid_all.append(ssim_hybrid)
 
         print(f"\n Image {idx+1} Results")
         print(f"{'Method':<20}{'PSNR':>10}{'SSIM':>12}")
@@ -438,6 +476,7 @@ def main():
         print(f"{'SSR':<20}{psnr_ssr:>10.2f}{ssim_ssr:>12.4f}")
         print(f"{'MSR':<20}{psnr_msr:>10.2f}{ssim_msr:>12.4f}")
         print(f"{'RetinexNet (FT)':<20}{psnr_reti:>10.2f}{ssim_reti:>12.4f}")
+        print(f"{'Hybrid':<20}{psnr_hybrid:>10.2f}{ssim_hybrid:>12.4f}")
 
     print("\n" + "="*45)
     print("Average Results Across All Test Images:")
@@ -446,6 +485,7 @@ def main():
     print(f"{'SSR':<20}{np.mean(psnr_ssr_all):>10.2f}{np.mean(ssim_ssr_all):>12.4f}")
     print(f"{'MSR':<20}{np.mean(psnr_msr_all):>10.2f}{np.mean(ssim_msr_all):>12.4f}")
     print(f"{'RetinexNet (FT)':<20}{np.mean(psnr_reti_all):>10.2f}{np.mean(ssim_reti_all):>12.4f}")
+    print(f"{'Hybrid':<20}{np.mean(psnr_hybrid_all):>10.2f}{np.mean(ssim_hybrid_all):>12.4f}")
     print("="*45)
 
 if __name__ == "__main__":
