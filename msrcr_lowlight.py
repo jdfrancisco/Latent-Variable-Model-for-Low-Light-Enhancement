@@ -282,6 +282,22 @@ def gradient_loss(pred, target):
     dx_t, dy_t = grad(target)
     return (torch.abs(dx_p - dx_t).mean() + torch.abs(dy_p - dy_t).mean())
 
+def edge_loss(pred, target):
+    sobel = nn.Conv2d(3, 3, 3, padding=1, bias=False)
+    sobel.weight.data = torch.tensor(
+        [[[[1, 0, -1],
+           [2, 0, -2],
+           [1, 0, -1]]] * 3], dtype=torch.float32, device=pred.device)
+    return torch.abs(sobel(pred) - sobel(target)).mean()
+
+def laplacian_loss(pred, target):
+    lap = nn.Conv2d(3, 3, 3, padding=1, bias=False)
+    lap.weight.data = torch.tensor(
+        [[[[0, 1, 0],
+           [1, -4, 1],
+           [0, 1, 0]]] * 3], dtype=torch.float32, device=pred.device)
+    return torch.abs(lap(pred) - lap(target)).mean()
+
 def train_retinexnet(model, train_loader_synth, train_loader_real, device, vgg):
     """Enhanced RetinexNet training with illumination decomposition, color consistency, and mixed-data pretraining."""
     criterion_l1 = nn.L1Loss()
@@ -344,7 +360,8 @@ def train_retinexnet(model, train_loader_synth, train_loader_real, device, vgg):
             loss_ssim = 1 - ms_ssim(out_gamma, high_gamma, data_range=1.0).mean()
             loss_tv = 0.03
 
-            loss = (1.0 * loss_l1) + (0.05 * loss_percep) + (0.5 * loss_ssim) + (0.1 * loss_tv)
+            loss = (1.0 * loss_l1) + (0.05 * loss_percep) + (0.4 * loss_ssim) + (0.2 * edge_loss(out, high)) + (0.2 * laplacian_loss(out, high))
+
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
