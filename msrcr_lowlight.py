@@ -83,33 +83,31 @@ def single_scale_retinex(img, sigma=15):
     retinex = (retinex - np.min(retinex)) / (np.max(retinex) - np.min(retinex)) * 255
     return np.uint8(np.clip(retinex, 0, 255))
 
-def multi_scale_retinex(img, sigmas=[15, 80, 250]):
+def multi_scale_retinex_cr(img, sigmas=[15, 80, 250], alpha=125, beta=46, gain=1, offset=0):
     img = img.astype(np.float32) + 1.0
-    retinex = np.zeros_like(img)
+
+    # MSR
+    msr = np.zeros_like(img)
     for sigma in sigmas:
         blur = cv2.GaussianBlur(img, (0, 0), sigma)
-        retinex += np.log10(img) - np.log10(blur)
-    retinex /= len(sigmas)
-    retinex = (retinex - np.min(retinex)) / (np.max(retinex) - np.min(retinex)) * 255
-    return np.uint8(np.clip(retinex, 0, 255))
+        msr += np.log10(img) - np.log10(blur)
+    msr /= len(sigmas)
 
-def color_restoration(img, alpha=125, beta=46):
+    # Color Restoration
     img_sum = np.sum(img, axis=2, keepdims=True)
-    color = beta * (np.log10(alpha * img + 1e-3) - np.log10(img_sum + 1e-3))
-    return color 
+    color = beta * (np.log10(alpha * img) - np.log10(img_sum))
 
-def msrcr_ycbcr(img):
-    ycbcr = cv2.cvtColor(img, cv2.COLOR_RGB2YCrCb)
-    y, cb, cr = cv2.split(ycbcr)
-    y = y.astype(np.float32) / 255.0
+    # MSRCR
+    msrcr_output = gain * (msr * color) + offset
 
-    y_retinex = multi_scale_retinex(y, [15, 80, 250])
-    y_retinex = np.clip((y_retinex - np.min(y_retinex)) / (np.max(y_retinex) - np.min(y_retinex)), 0, 1)
+    # Normalize back to [0,255] 
+    msrcr_output = (msrcr_output - np.min(msrcr_output)) / (np.max(msrcr_output) - np.min(msrcr_output))
+    msrcr_output = np.uint8(255 * np.clip(msrcr_output, 0, 1))
 
-    y_retinex = (y_retinex * 255).astype(np.uint8)
-    enhanced = cv2.merge([y_retinex, cb, cr])
-    enhanced_rgb = cv2.cvtColor(enhanced, cv2.COLOR_YCrCb2RGB)
-    return enhanced_rgb
+    # Apply Gray-World white balance
+    msrcr_output = gray_world_white_balance(msrcr_output)
+
+    return msrcr_output
 
 # ------------------------------------------------
 # Gray / White Balance for MSRCR
@@ -181,6 +179,12 @@ class SimpleRetinexNet(nn.Module):
         super(SimpleRetinexNet, self).__init__()
         mobilenet = models.mobilenet_v2(weights=models.MobileNet_V2_Weights.IMAGENET1K_V1).features
         self.encoder = nn.Sequential(*mobilenet[:14])
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(96, 64, 4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.ReLU(),
+        )
         for p in self.encoder.parameters():
             p.requires_grad = True
 
@@ -196,7 +200,7 @@ class SimpleRetinexNet(nn.Module):
 
     def forward(self, x):
         f = self.encoder(x)
-        f = self.fusion(f)
+        f = self.decoder(f)
         R = torch.tanh(self.reflectance_head(f))
         R = (R + 1) / 2
         L = torch.sigmoid(self.illumination_head(f))
@@ -229,15 +233,15 @@ def enhance_hybrid_msrcr_retinexnet(low_img, model, device):
     """
 
     # Step 1: Classical MSRCR
-    msrcr_img = msrcr_ycbcr(low_img)
+    msrcr = multi_scale_retinex_cr(low_img)
 
     # Convert MSRCR output to tensor for RetinexNet
     transform = transforms.Compose([
         transforms.Resize((512, 512)),
         transforms.ToTensor()
     ])
-    msrcr_pil = Image.fromarray(msrcr_img)
-    input_tensor = transform(msrcr_pil).unsqueeze(0).to(device)
+
+    input_tensor = transform(Image.fromarray(msrcr)).unsqueeze(0).to(device)
 
     # Step 2: CNN Refinement
     model.eval()
@@ -250,7 +254,7 @@ def enhance_hybrid_msrcr_retinexnet(low_img, model, device):
     # Resiize back to original resolution
     refined = cv2.resize(out_np, (low_img.shape[1], low_img.shape[0]))
 
-    return msrcr_img, refined
+    return refined
 
 # ------------------------------------------------
 # RetinexNet Fine-Tuning on LOL-v2
@@ -268,11 +272,21 @@ augment = T.Compose([
     T.GaussianBlur(kernel_size=(3, 3), sigma=(0.1, 1.5))
 ])
 
+def grad(x):
+    dx = x[:, :, :, :-1] - x[:, :, :, 1:]
+    dy = x[:, :, :-1, :] - x[:, :, 1:, :]
+    return dx, dy
+
+def gradient_loss(pred, target):
+    dx_p, dy_p = grad(pred)
+    dx_t, dy_t = grad(target)
+    return (torch.abs(dx_p - dx_t).mean() + torch.abs(dy_p - dy_t).mean())
+
 def train_retinexnet(model, train_loader_synth, train_loader_real, device, vgg):
     """Enhanced RetinexNet training with illumination decomposition, color consistency, and mixed-data pretraining."""
     criterion_l1 = nn.L1Loss()
     real_ratio = 0.2
-    phase1_epochs, phase2_epochs = 50, 100
+    phase1_epochs, phase2_epochs = 10, 10
 
     # Phase 1: Mixed synthetic + real pretraining
     synth_list = list(train_loader_synth.dataset)
@@ -298,9 +312,10 @@ def train_retinexnet(model, train_loader_synth, train_loader_real, device, vgg):
             loss_l1 = criterion_l1(out, high)
             loss_percep = F.mse_loss(vgg(out_gamma), vgg(high_gamma))
             loss_ssim = 1 - ms_ssim(out_gamma, high_gamma, data_range=1.0).mean()
-            loss_tv = total_variation_loss(L)
+            loss_tv = 0.03
 
-            loss = (1.0 * loss_l1) + (0.05 * loss_percep) + (0.5 * loss_ssim) + (0.1 * loss_tv)
+            loss = (1.0 * loss_l1) + (0.05 * loss_percep) + (0.3 * gradient_loss(out, high)) + (0.5 * loss_ssim)
+
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
@@ -327,7 +342,7 @@ def train_retinexnet(model, train_loader_synth, train_loader_real, device, vgg):
             loss_l1 = criterion_l1(out, high)
             loss_percep = F.mse_loss(vgg(out_gamma), vgg(high_gamma))
             loss_ssim = 1 - ms_ssim(out_gamma, high_gamma, data_range=1.0).mean()
-            loss_tv = total_variation_loss(L)
+            loss_tv = 0.03
 
             loss = (1.0 * loss_l1) + (0.05 * loss_percep) + (0.5 * loss_ssim) + (0.1 * loss_tv)
             loss.backward()
@@ -441,23 +456,25 @@ def main():
         low = low_img
         high = high_img
 
-        # Classical Retinex variants
-        low_balanced = gray_world_white_balance(low)
-        enhanced_ssr = single_scale_retinex(low)
-        enhanced_msr = multi_scale_retinex(low_balanced)
+        # SSR
+        ssr = single_scale_retinex(low)
+
+        # MSRCR
+        msrcr = multi_scale_retinex_cr(low)
 
         # Deep RetinexNet
         enhanced_retinexnet = enhance_with_retinexnet(low, retinexnet, device)
 
-        # Hybrid MSRCR -> ReinexNet
-        msrcr_img, hybrid_retinex = enhance_hybrid_msrcr_retinexnet(low, retinexnet, device)
+        # Hybrid MSRCR -> RetinexNet
+        alpha = 0.5 
+        hybrid_retinex = cv2.addWeighted(msrcr, alpha, enhanced_retinexnet, 1 - alpha, 0)
 
         # Visualization
-        visualize_results(low, high, enhanced_ssr, enhanced_msr, enhanced_retinexnet, hybrid_retinex, idx)
+        visualize_results(low, high, ssr, msrcr, enhanced_retinexnet, hybrid_retinex, idx)
 
         # Evaluation metrics
-        psnr_ssr, ssim_ssr = evaluate_metrics(enhanced_ssr, high)
-        psnr_msr, ssim_msr = evaluate_metrics(enhanced_msr, high)
+        psnr_ssr, ssim_ssr = evaluate_metrics(ssr, high)
+        psnr_msr, ssim_msr = evaluate_metrics(msrcr, high)
         psnr_reti, ssim_reti = evaluate_metrics(enhanced_retinexnet, high)
         psnr_hybrid, ssim_hybrid = evaluate_metrics(hybrid_retinex, high)
 
